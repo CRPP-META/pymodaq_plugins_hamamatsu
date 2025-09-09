@@ -1,8 +1,10 @@
 import numpy as np
-from pymodaq.utils.daq_utils import ThreadCommand
-from pymodaq.utils.data import DataFromPlugins, Axis, DataToExport
+from pymodaq_utils.utils import ThreadCommand
+from pymodaq_data.data import DataToExport, Axis
+from pymodaq_gui.parameter import Parameter
+
 from pymodaq.control_modules.viewer_utility_classes import DAQ_Viewer_base, comon_parameters, main
-from pymodaq.utils.parameter import Parameter
+from pymodaq.utils.data import DataFromPlugins
 
 import pylablib as pll
 pll.par["devices/dlls/dcamapi"] = "C:/Windows/System32"
