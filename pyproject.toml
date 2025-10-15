@@ -14,7 +14,6 @@ description = 'Plugin for Hamamatsu instuments including DCAM-API based cameras 
 dependencies = [
     "pymodaq>=5.0.0",
     "numpy",
-    "pymodaq",
     "pylablib",
     "pythonnet"
 ]
