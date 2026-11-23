@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Created on Mon Nov 25 14:20:19 2024
 
@@ -22,7 +21,7 @@ import time
 import numpy as np
 import System
 
-DLL = specu1b()
+driver = specu1b()
 unit_param = UNIT_PARAMETER()
 unit_info = UNIT_INFORMATION()
 
@@ -56,14 +55,14 @@ class MiniSpectro:
                 print("Hamamatsu Mini-spectrometer found")  # devices have a pid starting with 0x290
                 pid = dev.idProduct
 
-        self._handle = DLL.USB_OpenDevice(pid)  # Get index of spectrometer from pid
+        self._handle = driver.USB_OpenDevice(pid)  # Get index of spectrometer from pid
 
-        if DLL.USB_CheckDevice(self._handle) == 11:
+        if driver.USB_CheckDevice(self._handle) == 11:
             print('Check connection success')
         else:
             raise ValueError('Check connection failed, please close or reconnect device')
 
-        self._pipe = DLL.USB_OpenPipe(self._handle)
+        self._pipe = driver.USB_OpenPipe(self._handle)
 
         self._c_array = System.Array[System.Double]([0.0 for _ in range(6)])    # 6 calibration values
         self._origin_c_array = System.Array[System.Double]([206.6901787,        # Values from TokusPec at 1st boot
@@ -103,7 +102,7 @@ class MiniSpectro:
         reserved_param:
             Reserved byte
         """
-        DLL.USB_GetParameter(self._handle, unit_param)
+        driver.USB_GetParameter(self._handle, unit_param)
         self.integration_time = unit_param.unIntegrationTime
         self.gain = hex(unit_param.byGain)
         self.trigger_edge = hex(unit_param.byTriggerEdge)
@@ -134,20 +133,20 @@ class MiniSpectro:
             0x02 (External trigger mode 2 (gate trigger mode))
         """
         if integ_time is not None:
-            DLL.USB_GetParameter(self._handle, unit_param)[1].unIntegrationTime = integ_time
+            driver.USB_GetParameter(self._handle, unit_param)[1].unIntegrationTime = integ_time
         elif gain is not None:
-            DLL.USB_GetParameter(self._handle, unit_param)[1].byGain = gain
+            driver.USB_GetParameter(self._handle, unit_param)[1].byGain = gain
         elif trigger_edge is not None:
-            DLL.USB_GetParameter(self._handle, unit_param)[1].byTriggerEdge = trigger_edge
+            driver.USB_GetParameter(self._handle, unit_param)[1].byTriggerEdge = trigger_edge
         elif trigger_mode is not None:
-            DLL.USB_GetParameter(self._handle, unit_param)[1].byTriggerMode = trigger_mode
-        DLL.USB_SetParameter(self._handle, unit_param)
+            driver.USB_GetParameter(self._handle, unit_param)[1].byTriggerMode = trigger_mode
+        driver.USB_SetParameter(self._handle, unit_param)
     
     def set_default(self):
         """
         Set all parameters to default.
         """
-        DLL.USB_SetEepromDefaultParameter(self._handle, 0)
+        driver.USB_SetEepromDefaultParameter(self._handle, 0)
     
     def read_unit_information(self):
         """
@@ -170,7 +169,7 @@ class MiniSpectro:
             Upper wavelength the spectrometer is set to detect. Makes it
             possible to bound to the upper/last pixel on device sensor.
         """
-        DLL.USB_ReadUnitInformation(self._handle, unit_info)[0]
+        driver.USB_ReadUnitInformation(self._handle, unit_info)[0]
         self.unit_id = bytearray(unit_info.arybyUnitID).decode('ascii')
         self.sensor_name = bytearray(unit_info.arybySensorName).decode('ascii')
         self.serial_number = bytearray(unit_info.arybySerialNumber).decode('ascii')
@@ -197,7 +196,7 @@ class MiniSpectro:
         flag: hex
             The flag value needs to be 0xAA to allow writing to device.
         """
-        DLL.USB_WriteUnitInformation(self._handle, unit_info, flag)
+        driver.USB_WriteUnitInformation(self._handle, unit_info, flag)
 
     def read_calibration_value(self):
         """
@@ -209,7 +208,7 @@ class MiniSpectro:
             List of 6 float values corresponding to A, B1, B2, B3, B4 and B5 calibration coefficients.
             λ(nm) = A + B1*pix + B2*pix² + B3*pix³ + B4*pix⁴ + B5*pix⁵ with pix any pixel on sensor.
         """
-        DLL.USB_ReadCalibrationValue(self._handle, self._c_array)
+        driver.USB_ReadCalibrationValue(self._handle, self._c_array)
         self.calibration_list = list(self._c_array)
 
     def write_calibration_value(self, flag=None):
@@ -221,7 +220,7 @@ class MiniSpectro:
         flag: hex
             The flag value needs to be 0xAA to allow writing to device.
         """
-        DLL.USB_WriteCalibrationValue(self._handle, self._origin_c_array, flag)
+        driver.USB_WriteCalibrationValue(self._handle, self._origin_c_array, flag)
 
     def get_sensor_data(self):
         """
@@ -238,7 +237,7 @@ class MiniSpectro:
         """
         pixel_array = np.linspace(0, self.sensor_size-1, self.sensor_size)
         wl_array = np.linspace(self.lower_wl, self.upper_wl, self.sensor_size)
-        intensity = np.array(DLL.USB_GetSensorData(self._handle, self._pipe, self.sensor_size, self.buffer_array)[1])
+        intensity = np.array(driver.USB_GetSensorData(self._handle, self._pipe, self.sensor_size, self.buffer_array)[1])
 
         return pixel_array, wl_array, intensity
 
@@ -246,8 +245,8 @@ class MiniSpectro:
         """
         Close device.
         """
-        DLL.USB_ClosePipe(self._handle)
-        DLL.USB_CloseDevice(self._handle)
+        driver.USB_ClosePipe(self._handle)
+        driver.USB_CloseDevice(self._handle)
 
 
 if __name__ == "__main__":
