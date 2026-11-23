@@ -50,33 +50,54 @@ class MiniSpectro:
     """
     
     def __init__(self):
-        for dev in usb.core.find(find_all=True):
-            if hex(dev.idProduct).find("0x290") == 0:       # We make the assumption only Mini-spectrometers
-                print("Hamamatsu Mini-spectrometer found")  # devices have a pid starting with 0x290
-                pid = dev.idProduct
+        self._handle = None
+        self._is_connected = False
+    
+    def connect(self):
+        if self._is_connected:
+            raise RuntimeError("Minispectrometer is already connected")
+        try:
+            for dev in usb.core.find(find_all=True):
+                if hex(dev.idProduct).find("0x290") == 0:       # We make the assumption only Mini-spectrometers
+                    print("Hamamatsu Mini-spectrometer found")  # devices have a pid starting with 0x290
+                    pid = dev.idProduct
 
-        self._handle = driver.USB_OpenDevice(pid)  # Get index of spectrometer from pid
+            self._handle = driver.USB_OpenDevice(pid)  # Get index of spectrometer from pid
 
+            self._pipe = driver.USB_OpenPipe(self._handle)
+
+            self._c_array = System.Array[System.Double]([0.0 for _ in range(6)])    # 6 calibration values
+            # self._origin_c_array = System.Array[System.Double]([206.6901787,        # Values from TokusPec at 1st boot
+            #                                                     0.3771377233, 
+            #                                                     3.669128424e-5, 
+            #                                                     -1.287399061e-8,
+            #                                                     5.788371505e-12,
+            #                                                     -1.2738255e-15])
+            
+            self.read_unit_information()
+            self.get_parameter()
+            self.read_calibration_value()
+
+            self.buffer_array = System.Array[System.UInt16]([0 for _ in range(self.sensor_size)])
+
+        except UnboundLocalError as e:  # Will get triggered when minispectro is not connected (pid will be None)
+            self._is_connected = False
+            print(f"Minispectro does not seem to be connected. Error: {e}")
+        
+        self._is_connected = self.check_connection()
+    
+    def check_connection(self):
+        if self._handle is None:
+            self._is_connected = False
+            return False
         if driver.USB_CheckDevice(self._handle) == 11:
             print('Check connection success')
+            self._is_connected = True
         else:
-            raise ValueError('Check connection failed, please close or reconnect device')
+            self._is_connected = False
+            raise ValueError('Check connection failed, please close or reconnect Minispectro')
 
-        self._pipe = driver.USB_OpenPipe(self._handle)
-
-        self._c_array = System.Array[System.Double]([0.0 for _ in range(6)])    # 6 calibration values
-        self._origin_c_array = System.Array[System.Double]([206.6901787,        # Values from TokusPec at 1st boot
-                                                            0.3771377233, 
-                                                            3.669128424e-5, 
-                                                            -1.287399061e-8,
-                                                            5.788371505e-12,
-                                                            -1.2738255e-15])
-        
-        self.read_unit_information()
-        self.get_parameter()
-        self.read_calibration_value()
-
-        self.buffer_array = System.Array[System.UInt16]([0 for _ in range(self.sensor_size)])
+        return self._is_connected
 
     def get_parameter(self):
         """
@@ -206,10 +227,11 @@ class MiniSpectro:
         -------
         calibration_list: list(float)
             List of 6 float values corresponding to A, B1, B2, B3, B4 and B5 calibration coefficients.
-            λ(nm) = A + B1*pix + B2*pix² + B3*pix³ + B4*pix⁴ + B5*pix⁵ with pix any pixel on sensor.
+            λ(nm) = a0 + a1*pix + a2*pix² + a3*pix³ + a4*pix⁴ + a5*pix⁵ with pix any pixel on sensor.
         """
-        driver.USB_ReadCalibrationValue(self._handle, self._c_array)
-        self.calibration_list = list(self._c_array)
+        driver.USB_ReadCalibrationValue(self._handle, self._c_array)  # Set calibration values into self._c_array
+        a0, a1, a2, a3, a4, a5 = list(self._c_array)
+        self.wl = [a0 + a1*x + a2*x**2 + a3*x**3 + a4*x**4 + a5*x**5 for x in range(self.sensor_size)]
 
     def write_calibration_value(self, flag=None):
         """
@@ -235,19 +257,35 @@ class MiniSpectro:
         intensity: numpy.array()
             1D measured intensity array with values between 0 and 2^16-1 (65535)
         """
-        pixel_array = np.linspace(0, self.sensor_size-1, self.sensor_size)
-        wl_array = np.linspace(self.lower_wl, self.upper_wl, self.sensor_size)
-        intensity = np.array(driver.USB_GetSensorData(self._handle, self._pipe, self.sensor_size, self.buffer_array)[1])
+        if not self._is_connected:
+            raise RuntimeError("Not connected: call connect() first.")
+        # wl_array = np.linspace(self.lower_wl, self.upper_wl, self.sensor_size)
 
-        return pixel_array, wl_array, intensity
+        count = np.array(driver.USB_GetSensorData(self._handle, self._pipe, self.sensor_size, self.buffer_array)[1])
+
+        return count
 
     def close(self):
         """
         Close device.
         """
+        if not self._is_connected:
+            raise RuntimeError("Not connected: call connect() first.")
         driver.USB_ClosePipe(self._handle)
         driver.USB_CloseDevice(self._handle)
+        self._is_connected = False
 
 
 if __name__ == "__main__":
+    import matplotlib.pyplot as plt
     spectro = MiniSpectro()
+    spectro.connect()
+
+    count = spectro.get_sensor_data()
+
+    wl = spectro.wl
+
+    plt.plot(wl, count)
+    plt.show()
+
+    print("Done")
