@@ -9,10 +9,10 @@ from pymodaq_data.data import Axis, DataToExport
 from pymodaq_gui.parameter import Parameter
 from pymodaq_utils.utils import ThreadCommand
 
-from pymodaq_plugins_hamamatsu.hardware.minispectro import MiniSpectro
+from pymodaq_plugins_hamamatsu.hardware.minispectro import Minispectro
 
 
-class DAQ_1DViewer_MiniSpectro(DAQ_Viewer_base):
+class DAQ_1DViewer_Minispectro(DAQ_Viewer_base):
     """ Instrument plugin class for Hamamatsu USB Mini-spectrometers.
     
     This object inherits all functionalities to communicate with PyMoDAQ's DAQ_Viewer module through inheritance via
@@ -48,7 +48,7 @@ class DAQ_1DViewer_MiniSpectro(DAQ_Viewer_base):
         ]
 
     def ini_attributes(self):
-        self.controller: MiniSpectro = None
+        self.controller: Minispectro = None
         self.x_axis = None
 
     def ini_detector(self, controller=None):
@@ -69,7 +69,7 @@ class DAQ_1DViewer_MiniSpectro(DAQ_Viewer_base):
         # self.ini_detector_init(slave_controller=controller)
 
         if self.is_master:
-            self.controller = MiniSpectro()
+            self.controller = Minispectro()
             self.controller.connect()
             initialized = self.controller.check_connection()
         else:
@@ -92,7 +92,7 @@ class DAQ_1DViewer_MiniSpectro(DAQ_Viewer_base):
             self.settings.child('gain').setValue('None')
             self.settings.child('gain').setReadonly()
 
-        data_x_axis = self.controller.wl*1e-9
+        data_x_axis = np.array(self.controller.wl)*1e-9  # Axis' axes needs array + conversion to nm
         self.x_axis = Axis(data=data_x_axis, label='Wavelength', units='m', index=0)
 
         # Initialize viewers panel with the future type of data

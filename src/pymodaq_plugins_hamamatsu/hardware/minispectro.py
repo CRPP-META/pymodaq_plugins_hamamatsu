@@ -25,7 +25,7 @@ driver = specu1b()
 unit_param = UNIT_PARAMETER()
 unit_info = UNIT_INFORMATION()
 
-class MiniSpectro:
+class Minispectro:
     """
     Hamamatsu Minispectrometers class
     
@@ -259,7 +259,6 @@ class MiniSpectro:
         """
         if not self._is_connected:
             raise RuntimeError("Not connected: call connect() first.")
-        # wl_array = np.linspace(self.lower_wl, self.upper_wl, self.sensor_size)
 
         count = np.array(driver.USB_GetSensorData(self._handle, self._pipe, self.sensor_size, self.buffer_array)[1])
 
@@ -278,7 +277,7 @@ class MiniSpectro:
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    spectro = MiniSpectro()
+    spectro = Minispectro()
     spectro.connect()
 
     count = spectro.get_sensor_data()
