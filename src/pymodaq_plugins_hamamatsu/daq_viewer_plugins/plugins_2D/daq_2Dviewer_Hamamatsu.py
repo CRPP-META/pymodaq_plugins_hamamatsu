@@ -1,8 +1,11 @@
 import numpy as np
-from pymodaq.utils.daq_utils import ThreadCommand
-from pymodaq.utils.data import DataFromPlugins, Axis, DataToExport
+from pymodaq_utils.utils import ThreadCommand
+from pymodaq_data.data import DataToExport, Axis
+from pymodaq_gui.parameter import Parameter
+
 from pymodaq.control_modules.viewer_utility_classes import DAQ_Viewer_base, comon_parameters, main
-from pymodaq.utils.parameter import Parameter
+
+from pymodaq.utils.data import DataFromPlugins
 
 import pylablib as pll
 pll.par["devices/dlls/dcamapi"] = "C:/Windows/System32"
@@ -10,16 +13,18 @@ from pylablib.devices import DCAM
 from qtpy import QtWidgets, QtCore
 from time import perf_counter
 
-camera_number = DCAM.get_cameras_number()
-if camera_number == 0:
-    raise Exception('No DCAM camera was found.')
-
 
 class DAQ_2DViewer_Hamamatsu(DAQ_Viewer_base):
     """
+    Instrument plugin class for DCAM Hamamatsu cameras.
     """
+
+    # camera_number = DCAM.get_cameras_number()
+    # if camera_number == 0:
+    #     raise Exception('No DCAM camera was found.')
+
     params = comon_parameters + [
-        {'title': 'Camera index:', 'name': 'camera_index', 'type': 'int', 'value': 0, 'min': 0, 'max': camera_number},
+        {'title': 'Camera index:', 'name': 'camera_index', 'type': 'int', 'value': 0},
         {'title': 'Camera model:', 'name': 'camera_name', 'type': 'str', 'value': '', 'readonly': True},
         {'title': 'Update ROI', 'name': 'update_roi', 'type': 'bool_push', 'value': False},
         {'title': 'Clear ROI+Bin', 'name': 'clear_roi', 'type': 'bool_push', 'value': False},
@@ -47,61 +52,6 @@ class DAQ_2DViewer_Hamamatsu(DAQ_Viewer_base):
 
         # Disable "use ROI" option to avoid confusion with other buttons
         self.settings.child('ROIselect', 'use_ROI').setOpts(visible=False)
-
-    def commit_settings(self, param: Parameter):
-        """Apply the consequences of a change of value in the detector settings
-
-        Parameters
-        ----------
-        param: Parameter
-            A given parameter (within detector_settings) whose value has been changed by the user
-        """
-        if param.name() == "exposure_time":
-            self.controller.set_exposure(param.value() / 1000)
-
-        if param.name() == "fps_on":
-            self.settings.child('timing_opts', 'fps').setOpts(visible=param.value())
-
-        if param.name() == "update_roi":
-            if param.value():  # Switching on ROI
-
-                # We handle ROI and binning separately for clarity
-                (old_x, _, old_y, _, xbin, ybin) = self.controller.get_roi()  # Get current binning
-
-                # Values need to be rescaled by binning factor and shifted by current x0,y0 to be correct.
-                new_x = (old_x + self.settings.child('ROIselect', 'x0').value()) * xbin
-                new_y = (old_y + self.settings.child('ROIselect', 'y0').value()) * xbin
-                new_width = self.settings.child('ROIselect', 'width').value() * ybin
-                new_height = self.settings.child('ROIselect', 'height').value() * ybin
-
-                new_roi = (new_x, new_width, xbin, new_y, new_height, ybin)
-                self.update_rois(new_roi)
-                # recenter rectangle
-                self.settings.child('ROIselect', 'x0').setValue(0)
-                self.settings.child('ROIselect', 'y0').setValue(0)
-                param.setValue(False)
-
-        if param.name() == 'binning':
-            # We handle ROI and binning separately for clarity
-            (x0, w, y0, h, *_) = self.controller.get_roi()  # Get current ROI
-            xbin = self.settings.child('binning').value()
-            ybin = self.settings.child('binning').value()
-            new_roi = (x0, w, xbin, y0, h, ybin)
-            self.update_rois(new_roi)
-
-        if param.name() == "clear_roi":
-            if param.value():  # Switching on ROI
-                wdet, hdet = self.controller.get_detector_size()
-                # self.settings.child('ROIselect', 'x0').setValue(0)
-                # self.settings.child('ROIselect', 'width').setValue(wdet)
-                self.settings.child('binning').setValue(1)
-                #
-                # self.settings.child('ROIselect', 'y0').setValue(0)
-                # new_height = self.settings.child('ROIselect', 'height').setValue(hdet)
-
-                new_roi = (0, wdet, 1, 0, hdet, 1)
-                self.update_rois(new_roi)
-                param.setValue(False)
 
     def ini_detector(self, controller=None):
         """Detector communication initialization
@@ -263,9 +213,9 @@ class DAQ_2DViewer_Hamamatsu(DAQ_Viewer_base):
         # Update reading
         self.settings.child('timing_opts', 'fps').setValue(round(self.fps, 1))
 
-    def callback(self):
-        """optional asynchrone method called when the detector has finished its acquisition of data"""
-        raise NotImplementedError
+    # def callback(self):
+    #     """optional asynchrone method called when the detector has finished its acquisition of data"""
+    #     raise NotImplementedError
 
     def close(self):
         """
@@ -283,6 +233,59 @@ class DAQ_2DViewer_Hamamatsu(DAQ_Viewer_base):
         self.controller.stop_acquisition()
         self.controller.clear_acquisition()
         return ''
+    
+    def commit_settings(self, param: Parameter):
+        """Apply the consequences of a change of value in the detector settings
+
+        Parameters
+        ----------
+        param: Parameter
+            A given parameter (within detector_settings) whose value has been changed by the user
+        """
+        if param.name() == "exposure_time":
+            self.controller.set_exposure(param.value() / 1000)
+
+        if param.name() == "fps_on":
+            self.settings.child('timing_opts', 'fps').setOpts(visible=param.value())
+
+        if param.name() == "update_roi" and param.value():  # Switching on ROI
+                # We handle ROI and binning separately for clarity
+                (old_x, _, old_y, _, xbin, ybin) = self.controller.get_roi()  # Get current binning
+
+                # Values need to be rescaled by binning factor and shifted by current x0,y0 to be correct.
+                new_x = (old_x + self.settings.child('ROIselect', 'x0').value()) * xbin
+                new_y = (old_y + self.settings.child('ROIselect', 'y0').value()) * xbin
+                new_width = self.settings.child('ROIselect', 'width').value() * ybin
+                new_height = self.settings.child('ROIselect', 'height').value() * ybin
+
+                new_roi = (new_x, new_width, xbin, new_y, new_height, ybin)
+                self.update_rois(new_roi)
+                # recenter rectangle
+                self.settings.child('ROIselect', 'x0').setValue(0)
+                self.settings.child('ROIselect', 'y0').setValue(0)
+                param.setValue(False)
+
+        if param.name() == 'binning':
+            # We handle ROI and binning separately for clarity
+            (x0, w, y0, h, *_) = self.controller.get_roi()  # Get current ROI
+            xbin = self.settings.child('binning').value()
+            ybin = self.settings.child('binning').value()
+            new_roi = (x0, w, xbin, y0, h, ybin)
+            self.update_rois(new_roi)
+
+        if param.name() == "clear_roi":
+            if param.value():  # Switching on ROI
+                wdet, hdet = self.controller.get_detector_size()
+                # self.settings.child('ROIselect', 'x0').setValue(0)
+                # self.settings.child('ROIselect', 'width').setValue(wdet)
+                self.settings.child('binning').setValue(1)
+                #
+                # self.settings.child('ROIselect', 'y0').setValue(0)
+                # new_height = self.settings.child('ROIselect', 'height').setValue(hdet)
+
+                new_roi = (0, wdet, 1, 0, hdet, 1)
+                self.update_rois(new_roi)
+                param.setValue(False)
 
 
 class DCAMCallback(QtCore.QObject):
