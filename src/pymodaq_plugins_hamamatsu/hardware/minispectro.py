@@ -1,290 +1,221 @@
+"""Hamamatsu TM-series mini-spectrometer (C10082 / C10083) driver, Python 3 + pyusb.
+
+Port of HamamatsuMiniSpectrometer.py (usbspecdrivers on SourceForge) by
+Carsten Frank and Wolfgang Schoenfeld, GPL v2. This port keeps the same
+license (GPL v2) and is based on their reverse-engineered USB protocol.
+
+Needs: pip install pyusb numpy (and libusb-1.0 on the system)
+On Linux → needs a udev rule so you can open the device without root,
+e.g. in /etc/udev/rules.d/99-hamamatsu.rules:
+SUBSYSTEM=="usb", ATTR{idVendor}=="0661", MODE="0666"
 """
-Created on Mon Nov 25 14:20:19 2024
 
-@author: Bastien Bégon
-"""
+import argparse
+import time
 
-import clr
-import sys
-
-driver_dir = r"C:\\Program Files\\Hamamatsu\\TokuSpec"  # Path to specu1b.dll file folder
-sys.path.append(driver_dir)
-
-clr.AddReference("specu1b")
-
-from specu1b_DLL import specu1b, UNIT_PARAMETER, UNIT_INFORMATION
-
+import numpy as np
 import usb.core
 import usb.util
 
-import time
-import numpy as np
-import System
+VENDOR_ID = 0x0661
+PRODUCT_IDS = {
+    0x2906: "C9407MA",
+    0x2909: "C10082/C10083",
+}
 
-driver = specu1b()
-unit_param = UNIT_PARAMETER()
-unit_info = UNIT_INFORMATION()
+FRAME_BYTES = 0x1040            # one frame = 0x820 big-endian 16-bit words
+FRAME_WORDS = FRAME_BYTES // 2
+
+# vendor control requests
+REQ_READ_ROM = 0x04             # IN : wValue = ROM address
+REQ_SET_INTEGRATION = 0x0A      # OUT: 4 bytes, scrambled order (see below)
+REQ_GET_INTEGRATION = 0x0B      # IN : 4 bytes, big-endian
+
+ROM_SERIAL = 0x1D4              # 8 bytes ASCII
+ROM_SENSOR = 0x1DC              # 16 bytes ASCII
+ROM_COEFF = [0x000, 0x010, 0x020, 0x030, 0x040, 0x050]  # a0..a5, 16 bytes ASCII floats
+
+MIN_INT_US = 10_000
+MAX_INT_US = 10_000_000
+
 
 class Minispectro:
-    """
-    Hamamatsu Minispectrometers class
-    
-    Methods
-    -------
-    get_parameter()
-        Get currently set parameters (integration time, gain, trigger modes).
-    set_parameter(integ_time, gain, trigger_edge, trigger_mode)
-        Set specified parameter with specified value.
-    set_default()
-        Set all parameters to default.
-    read_unit_information()
-        Read device information.
-    write_unit_information()
-        Write information into USB device.
-    read_calibration_value()
-        Write calibration values with original values.
-    get_sensor_data()
-        Get sensor data currently in buffer and wipe buffer.
-    close()
-        Close device.
-    """
-    
-    def __init__(self):
-        self._handle = None
-        self._is_connected = False
-    
-    def connect(self):
-        if self._is_connected:
-            raise RuntimeError("Minispectrometer is already connected")
+    def __init__(self, serial=None, product_id=None, integration_us=MIN_INT_US):
+        self.dev = self._find(serial, product_id)
+        self._claim()
+
+        self.serial = self._rom_text(ROM_SERIAL, 8)
+        self.sensor_name = self._rom_text(ROM_SENSOR, 16)
+        self.coeffs = [float(self._rom_text(a, 16)) for a in ROM_COEFF]
+
+        # S10420-1006/-1106 CCDs: first spectral pixel is 10 pixels after the
+        # start index. Other sensors (S8377/S8378): no offset.
+        self.pixel_offset = 10 if self.sensor_name in ("S10420-1106", "S10420-1006") else 0
+
+        self.ep = self._find_in_endpoint()
+        self.wl = None
+        self.integration_us = 0
+        if not self.set_integration_time(integration_us):
+            raise RuntimeError("could not set integration time")
+        self.get_spectrum()     # first frame also fills self.wl
+
+    # ---- discovery / setup -------------------------------------------------
+    @staticmethod
+    def _find(serial, product_id):
+        pids = [product_id] if product_id else list(PRODUCT_IDS)
+        devs = [d for d in usb.core.find(find_all=True, idVendor=VENDOR_ID)
+                if d.idProduct in pids]
+        if not devs:
+            raise RuntimeError(
+                "No Hamamatsu spectrometer found (VID 0x0661). Check `lsusb`; "
+                "if the PID is not in PRODUCT_IDS, pass product_id=0x....")
+        if serial is None:
+            return devs[0]
+        for d in devs:
+            d.set_configuration()
+            if Minispectro._read_text(d, ROM_SERIAL, 8) == serial:
+                return d
+        raise RuntimeError(f"No spectrometer with serial {serial!r}")
+
+    def _claim(self):
         try:
-            for dev in usb.core.find(find_all=True):
-                if hex(dev.idProduct).find("0x290") == 0:       # We make the assumption only Mini-spectrometers
-                    print("Hamamatsu Mini-spectrometer found")  # devices have a pid starting with 0x290
-                    pid = dev.idProduct
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+        except (NotImplementedError, usb.core.USBError):
+            pass
+        self.dev.set_configuration()
 
-            self._handle = driver.USB_OpenDevice(pid)  # Get index of spectrometer from pid
+    def _find_in_endpoint(self):
+        intf = self.dev.get_active_configuration()[(0, 0)]
+        eps = [e for e in intf
+               if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN]
+        bulk = [e for e in eps
+                if usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK]
+        if not (bulk or eps):
+            raise RuntimeError("no IN endpoint found")
+        return (bulk or eps)[0]
 
-            self._pipe = driver.USB_OpenPipe(self._handle)
+    # ---- ROM / control transfers ------------------------------------------
+    @staticmethod
+    def _read_text(dev, addr, length):
+        raw = dev.ctrl_transfer(0xC0, REQ_READ_ROM, addr, 0, length, timeout=2000)
+        return bytes(raw).decode("ascii", "ignore").strip("\x00 \r\n\t")
 
-            self._c_array = System.Array[System.Double]([0.0 for _ in range(6)])    # 6 calibration values
-            # self._origin_c_array = System.Array[System.Double]([206.6901787,        # Values from TokusPec at 1st boot
-            #                                                     0.3771377233, 
-            #                                                     3.669128424e-5, 
-            #                                                     -1.287399061e-8,
-            #                                                     5.788371505e-12,
-            #                                                     -1.2738255e-15])
-            
-            self.read_unit_information()
-            self.get_parameter()
-            self.read_calibration_value()
+    def _rom_text(self, addr, length):
+        return self._read_text(self.dev, addr, length)
 
-            self.buffer_array = System.Array[System.UInt16]([0 for _ in range(self.sensor_size)])
+    def set_integration_time(self, us, verify=True):
+        """Integration time in microseconds, 10 ms .. 10 s."""
+        us = int(us)
+        if not MIN_INT_US <= us <= MAX_INT_US:
+            raise ValueError(f"integration time must be {MIN_INT_US}..{MAX_INT_US} us")
+        payload = bytes([(us >> 16) & 0xFF, (us >> 24) & 0xFF, us & 0xFF, (us >> 8) & 0xFF])
+        t0 = time.monotonic()
+        while True:
+            self.dev.ctrl_transfer(0x40, REQ_SET_INTEGRATION, 1, 0, payload, timeout=1000)
+            if not verify:
+                break
+            time.sleep(0.01)
+            if self.get_integration_time() == us:
+                break
+            if time.monotonic() - t0 > 1.0:
+                return False
+        self.integration_us = us
+        return True
 
-        except UnboundLocalError as e:  # Will get triggered when minispectro is not connected (pid will be None)
-            self._is_connected = False
-            print(f"Minispectro does not seem to be connected. Error: {e}")
-        
-        self._is_connected = self.check_connection()
-    
-    def check_connection(self):
-        if self._handle is None:
-            self._is_connected = False
+    def get_integration_time(self):
+        for _ in range(50):
+            res = bytes(self.dev.ctrl_transfer(0xC0, REQ_GET_INTEGRATION, 1, 0, 4, timeout=2000))
+            if len(res) == 4:
+                return int.from_bytes(res, "big")
+            time.sleep(0.01)
+        raise RuntimeError("bad answer to get_integration_time")
+
+    # ---- frame acquisition -------------------------------------------------
+    def _read_words(self, nbytes, timeout_ms):
+        buf = bytearray()
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while len(buf) < nbytes:
+            if time.monotonic() > deadline:
+                raise TimeoutError("USB read timed out")
+            buf += bytes(self.ep.read(nbytes - len(buf), timeout=timeout_ms))
+        return np.frombuffer(bytes(buf[:nbytes]), dtype=">u2").astype(np.int64)
+
+    @staticmethod
+    def _valid_header(w, off=0):
+        if off + 6 > len(w):
             return False
-        if driver.USB_CheckDevice(self._handle) == 11:
-            print('Check connection success')
-            self._is_connected = True
-        else:
-            self._is_connected = False
-            raise ValueError('Check connection failed, please close or reconnect Minispectro')
+        flag, idx, _active, start, end, npix = (int(x) for x in w[off:off + 6])
+        return flag == 2 and 0 <= idx <= 2 and (npix == end - start or npix == end)
 
-        return self._is_connected
+    def get_spectrum(self, timeout=None):
+        """Return one spectrum as an int array (raw counts, one value per pixel).
 
-    def get_parameter(self):
+        Frame header words: [0]=2 (valid; 3 = no external power), [1]=0..2,
+        [2]=active pixels, [3]=start index, [4]=end index, [5]=pixels, [8]=counter.
         """
-        Get currently set parameters.
+        if timeout is None:
+            timeout = self.integration_us / 1e6 * 8.0 + 1.0
+        t0 = time.monotonic()
+        read_timeout_ms = int(timeout * 1000) + 1000
 
-        Returns
-        ----------
-        integration_time: int
-            Range is 5000µs-10000000µs (5ms-10s). The minimum integration times
-            differ depending on the model. Minimum is 10000 µs for C10083CA.
-        gain: hex
-            0x00 (Low gain)
-            0x01 (High gain)
-            0xFF (Gain switching function is unavailable)
-        trigger_edge: hex
-            0x00 (Rising edge (H level))
-            0x01 (Falling edge (L level))
-            0xFF (External trigger function is unavailable)
-        trigger_mode: hex
-            0x00 (Internal trigger mode (freerun))
-            0x01 (External trigger mode 1 (edge trigger detection))
-            0x02 (External trigger mode 2 (gate trigger mode))
-        reserved_param:
-            Reserved byte
-        """
-        driver.USB_GetParameter(self._handle, unit_param)
-        self.integration_time = unit_param.unIntegrationTime
-        self.gain = hex(unit_param.byGain)
-        self.trigger_edge = hex(unit_param.byTriggerEdge)
-        self.trigger_mode = hex(unit_param.byTriggerMode)
-        self.reserved_param = unit_param.byReserved
+        while True:
+            if time.monotonic() - t0 > timeout:
+                raise TimeoutError("no valid spectrum received")
+            w = self._read_words(FRAME_BYTES, read_timeout_ms)
 
-    def set_parameter(self, integ_time=None, gain=None, trigger_edge=None, trigger_mode=None):
-        """
-        Set specified parameter with specified value.
-        Integration time, gain, trigger edge and trigger mode can be set
+            if not w.any():                       # device not ready yet
+                time.sleep(0.002)
+                continue
+            if w[0] == 3:
+                raise RuntimeError("Spectrometer has no power: USB is connected, "
+                                   "use the AC adapter too.")
+            if self._valid_header(w):
+                break
 
-        Parameters
-        ----------
-        integration_time: int
-            Range is 5000µs-10000000µs (5ms-10s). The minimum integration times
-            differ depending on the model. Minimum is 10000 µs for C10083CA.
-        gain: hex
-            0x00 (Low gain)
-            0x01 (High gain)
-            0xFF (Gain switching function is unavailable)
-        trigger_edge: hex
-            0x00 (Rising edge (H level))
-            0x01 (Falling edge (L level))
-            0xFF (External trigger function is unavailable)
-        trigger_mode: hex
-            0x00 (Internal trigger mode (freerun))
-            0x01 (External trigger mode 1 (edge trigger detection))
-            0x02 (External trigger mode 2 (gate trigger mode))
-        """
-        if integ_time is not None:
-            driver.USB_GetParameter(self._handle, unit_param)[1].unIntegrationTime = integ_time
-        elif gain is not None:
-            driver.USB_GetParameter(self._handle, unit_param)[1].byGain = gain
-        elif trigger_edge is not None:
-            driver.USB_GetParameter(self._handle, unit_param)[1].byTriggerEdge = trigger_edge
-        elif trigger_mode is not None:
-            driver.USB_GetParameter(self._handle, unit_param)[1].byTriggerMode = trigger_mode
-        driver.USB_SetParameter(self._handle, unit_param)
-    
-    def set_default(self):
-        """
-        Set all parameters to default.
-        """
-        driver.USB_SetEepromDefaultParameter(self._handle, 0)
-    
-    def read_unit_information(self):
-        """
-        Read device information.
+            # stream out of sync: find the next header and drop the bytes before it
+            offset = next((o for o in range(len(w)) if w[o] == 2 and self._valid_header(w, o)),
+                          len(w))
+            self._read_words(offset * 2, read_timeout_ms)   # discard, then read a fresh frame
 
-        Returns
-        -------
-        unit_id: str
-            The Hamamatsu device ID starting with 1 letter and 1 number.
-        sensor_name: str
-            The name of the sensor used in the spectrometer
-        serial_number: str
-            Serial number of the device.
-        reserved: str
-            Reserved and unused bytes according to .DLL documentation
-        wl_lower: int
-            Lower wavelength the spectrometer is set to detect. Makes it
-            possible to bound to the lower/first pixel on device sensor.
-        wl_upper: int
-            Upper wavelength the spectrometer is set to detect. Makes it
-            possible to bound to the upper/last pixel on device sensor.
-        """
-        driver.USB_ReadUnitInformation(self._handle, unit_info)[0]
-        self.unit_id = bytearray(unit_info.arybyUnitID).decode('ascii')
-        self.sensor_name = bytearray(unit_info.arybySensorName).decode('ascii')
-        self.serial_number = bytearray(unit_info.arybySerialNumber).decode('ascii')
-        self.reserved = bytearray(unit_info.arybyReserved)
-        self.lower_wl = unit_info.usWaveLengthLower
-        self.upper_wl = unit_info.usWaveLengthUpper
+        active, start = int(w[2]), int(w[3]) + self.pixel_offset
+        if self.wl is None:
+            pix = np.arange(1, active + 1, dtype=float)
+            self.wl = sum(c * pix ** k for k, c in enumerate(self.coeffs))
+        return w[start:start + active]
 
-        if self.unit_id.find('1') == 1:  # Check 2nd character in unit_id string
-            self.sensor_size = 256       # to determine sensor size
-        elif self.unit_id.find('2') == 1:
-            self.sensor_size = 512
-        elif self.unit_id.find('3') == 1:
-            self.sensor_size = 1024
-        elif self.unit_id.find('4') == 1:
-            self.sensor_size = 2048
-    
-    def write_unit_information(self, flag=None):
-        """
-        Write information into USB device. Unit ID, sensor name, serial number and 
-        spectral response range (upper and lower limits) are written.
-
-        Parameters
-        ----------
-        flag: hex
-            The flag value needs to be 0xAA to allow writing to device.
-        """
-        driver.USB_WriteUnitInformation(self._handle, unit_info, flag)
-
-    def read_calibration_value(self):
-        """
-        Reads calibration coefficients saved in device
-
-        Returns
-        -------
-        calibration_list: list(float)
-            List of 6 float values corresponding to A, B1, B2, B3, B4 and B5 calibration coefficients.
-            λ(nm) = a0 + a1*pix + a2*pix² + a3*pix³ + a4*pix⁴ + a5*pix⁵ with pix any pixel on sensor.
-        """
-        driver.USB_ReadCalibrationValue(self._handle, self._c_array)  # Set calibration values into self._c_array
-        a0, a1, a2, a3, a4, a5 = list(self._c_array)
-        self.wl = [a0 + a1*x + a2*x**2 + a3*x**3 + a4*x**4 + a5*x**5 for x in range(self.sensor_size)]
-
-    def write_calibration_value(self, flag=None):
-        """
-        Write calibration values with original values.
-        
-        Parameters
-        ----------
-        flag: hex
-            The flag value needs to be 0xAA to allow writing to device.
-        """
-        driver.USB_WriteCalibrationValue(self._handle, self._origin_c_array, flag)
-
-    def get_sensor_data(self):
-        """
-        Get sensor data currently in buffer and wipe buffer.
-
-        Returns
-        -------
-        pixel_array: numpy.array()
-            1D pixel array of device sensor
-        wl_array: numpy.array()
-            1D array of wavelengths from lower_wl to upper_wl
-        intensity: numpy.array()
-            1D measured intensity array with values between 0 and 2^16-1 (65535)
-        """
-        if not self._is_connected:
-            raise RuntimeError("Not connected: call connect() first.")
-
-        count = np.array(driver.USB_GetSensorData(self._handle, self._pipe, self.sensor_size, self.buffer_array)[1])
-
-        return count
+    def read_spectrum(self, averages=1):
+        """Return (wavelengths_nm, counts); counts averaged over `averages` frames."""
+        acc = np.zeros_like(self.get_spectrum(), dtype=float)
+        for _ in range(averages):
+            acc += self.get_spectrum()
+        return self.wl, acc / averages
 
     def close(self):
-        """
-        Close device.
-        """
-        if not self._is_connected:
-            raise RuntimeError("Not connected: call connect() first.")
-        driver.USB_ClosePipe(self._handle)
-        driver.USB_CloseDevice(self._handle)
-        self._is_connected = False
+        usb.util.dispose_resources(self.dev)
 
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    spectro = Minispectro()
-    spectro.connect()
+    ap = argparse.ArgumentParser(description="Acquire one spectrum from a Hamamatsu mini-spectrometer")
+    ap.add_argument("-t", "--integration-ms", type=float, default=10.0)
+    ap.add_argument("-n", "--averages", type=int, default=1)
+    ap.add_argument("-o", "--output", help="write wavelength,counts CSV")
+    ap.add_argument("--pid", type=lambda s: int(s, 0), help="USB product id, e.g. 0x2909")
+    args = ap.parse_args()
 
-    count = spectro.get_sensor_data()
+    spec = Minispectro(product_id=args.pid)
+    print(f"serial {spec.serial}, sensor {spec.sensor_name}, a0={spec.coeffs[0]:.3f}")
+    spec.set_integration_time(args.integration_ms * 1000)
+    wl, counts = spec.read_spectrum(args.averages)
 
-    wl = spectro.wl
+    # for i in range(100):
+    #     wl, counts = spec.read_spectrum(args.averages)
+    #     print(f"max_count = {int(counts.max())} at {wl[counts.argmax()]:.2f} nm")
+        # print(f"{len(wl)} pixels, {wl[0]:.2f}-{wl[-1]:.2f} nm, peak {int(counts.max())} counts at {wl[counts.argmax()]:.2f} nm")
+    # if args.output:
+    #     np.savetxt(args.output, np.c_[wl, counts], delimiter=",", header="wavelength_nm,counts")
+    # spec.close()
 
-    plt.plot(wl, count)
-    plt.show()
-
-    print("Done")
+    # plt.plot(wl, counts)
+    # plt.show()
