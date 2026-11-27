@@ -50,7 +50,7 @@ class Minispectro:
 
         # S10420-1006/-1106 CCDs: first spectral pixel is 10 pixels after the
         # start index. Other sensors (S8377/S8378): no offset.
-        self.pixel_offset = 10 if self.sensor_name in ("S10420-1106", "S10420-1006") else 0
+        self.pixel_offset = 10 if self.sensor_name.startswith(("S10420-1106", "S10420-1006")) else 0
 
         self.ep = self._find_in_endpoint()
         self.wl = None
@@ -180,7 +180,7 @@ class Minispectro:
 
         active, start = int(w[2]), int(w[3]) + self.pixel_offset
         if self.wl is None:
-            pix = np.arange(1, active + 1, dtype=float)
+            pix = np.arange(0, active, dtype=float)
             self.wl = sum(c * pix ** k for k, c in enumerate(self.coeffs))
         return w[start:start + active]
 
@@ -196,26 +196,19 @@ class Minispectro:
 
 
 if __name__ == "__main__":
+    import time
     import matplotlib.pyplot as plt
-    ap = argparse.ArgumentParser(description="Acquire one spectrum from a Hamamatsu mini-spectrometer")
-    ap.add_argument("-t", "--integration-ms", type=float, default=10.0)
-    ap.add_argument("-n", "--averages", type=int, default=1)
-    ap.add_argument("-o", "--output", help="write wavelength,counts CSV")
-    ap.add_argument("--pid", type=lambda s: int(s, 0), help="USB product id, e.g. 0x2909")
-    args = ap.parse_args()
 
-    spec = Minispectro(product_id=args.pid)
+
+    spec = Minispectro()
     print(f"serial {spec.serial}, sensor {spec.sensor_name}, a0={spec.coeffs[0]:.3f}")
-    spec.set_integration_time(args.integration_ms * 1000)
-    wl, counts = spec.read_spectrum(args.averages)
+    # spec.set_integration_time(args.integration_ms * 1000)
+    spec.set_integration_time(10000)
+    spec.read_spectrum()
+    time.sleep(0.5)
+    wl, counts = spec.read_spectrum()
 
-    # for i in range(100):
-    #     wl, counts = spec.read_spectrum(args.averages)
-    #     print(f"max_count = {int(counts.max())} at {wl[counts.argmax()]:.2f} nm")
-        # print(f"{len(wl)} pixels, {wl[0]:.2f}-{wl[-1]:.2f} nm, peak {int(counts.max())} counts at {wl[counts.argmax()]:.2f} nm")
-    # if args.output:
-    #     np.savetxt(args.output, np.c_[wl, counts], delimiter=",", header="wavelength_nm,counts")
-    # spec.close()
+    plt.plot(wl, counts)
+    plt.show()
 
-    # plt.plot(wl, counts)
-    # plt.show()
+    spec.close()
