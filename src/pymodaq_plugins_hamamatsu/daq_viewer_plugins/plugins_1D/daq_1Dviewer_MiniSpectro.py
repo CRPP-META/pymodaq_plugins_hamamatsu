@@ -12,7 +12,7 @@ from pymodaq_utils.utils import ThreadCommand
 from pymodaq_plugins_hamamatsu.hardware.minispectro import Minispectro
 
 
-class DAQ_1DViewer_Minispectro(DAQ_Viewer_base):
+class DAQ_1DViewer_MiniSpectro(DAQ_Viewer_base):
     """ Instrument plugin class for Hamamatsu USB Mini-spectrometers.
     
     This object inherits all functionalities to communicate with PyMoDAQ's DAQ_Viewer module through inheritance via
